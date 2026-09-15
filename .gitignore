@@ -1,0 +1,30 @@
+# Python bytecode & cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# PyTorch weights & large model binaries
+*.pth
+*.pt
+*.bin
+*.h5
+*.keras
+
+# Generated plots & images
+*.png
+*.jpg
+*.jpeg
+*.svg
+outputs/*.png
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+# Virtual environments
+env/
+venv/
+.venv/
+
+# IDE / Editor artifacts
+.vscode/
+.idea/

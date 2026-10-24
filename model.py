@@ -70,6 +70,10 @@ class ResidualOptionANN(nn.Module):
     def predict_price(self, x: torch.Tensor, c_bs: torch.Tensor) -> torch.Tensor:
         """Computes C_pred = C_bs + E_hat, enforcing non-negativity."""
         e_hat = self.forward(x)
+        if c_bs.ndim == 1:
+            c_bs = c_bs.unsqueeze(-1)
+        if c_bs.shape != e_hat.shape:
+            raise ValueError("c_bs must contain one baseline price per input row")
         c_pred = c_bs + e_hat
         return torch.clamp(c_pred, min=0.0)
 

@@ -1,23 +1,33 @@
-import warnings
-warnings.filterwarnings('ignore')
-
-from flask import Flask, render_template, request, jsonify
+from flask import Flask, render_template, request, jsonify, send_from_directory, abort
+from pathlib import Path
 import yfinance as yf
 import numpy as np
 import pandas as pd
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.metrics import mean_squared_error
-import json
+import re
 import os
 
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 
 app = Flask(__name__)
+app.config['MAX_CONTENT_LENGTH'] = 2 * 1024 * 1024
+app.config['STOCK_OPTION_EPOCHS'] = 25
+app.config['OPTION_RESULTS_DIR'] = str(Path(__file__).parent / 'outputs' / 'comparison')
+OPTION_CHARTS = {
+    'overall_comparison.png': ('Overall pricing error', 'Compare RMSE and MAE on the same held-out contracts. Lower bars mean smaller errors.'),
+    'actual_vs_predicted.png': ('Predicted vs. actual prices', 'Points closer to the dashed diagonal are more accurate. All four methods use the same test contracts.'),
+    'error_across_moneyness.png': ('Error across moneyness', 'Compare absolute pricing errors as the stock-to-strike ratio changes.'),
+    'moneyness_comparison.png': ('Accuracy by contract category', 'OTM: S/K < 0.97; ATM: 0.97 ≤ S/K < 1.03; ITM: S/K ≥ 1.03.'),
+    'loss_curves.png': ('Neural network learning curves', 'Validation MSE during training. Direct ANN and LSTM learn standardized price/strike; residual ANN learns standardized error/strike, so their loss magnitudes are not directly comparable. Black-Scholes has no training curve.'),
+}
 
 # ─── Helpers ────────────────────────────────────────────────────────────────
 
 def clean_symbol(raw: str) -> str:
     raw = raw.strip().upper()
+    if not re.fullmatch(r'[A-Z0-9&-]+(?:\.NS)?', raw):
+        raise ValueError("Enter an NSE symbol such as RELIANCE or TCS.NS.")
     if not raw.endswith(".NS"):
         raw = raw + ".NS"
     return raw
@@ -38,12 +48,12 @@ def format_large(num, default="N/A"):
         return "N/A"
     try:
         num = float(num)
-        if np.isnan(num):
+        if not np.isfinite(num):
             return "N/A"
         if num >= 1e12:
-            return f"₹{num/1e12:.2f}T Cr."
+            return f"₹{num/1e12:.2f} L Cr."
         if num >= 1e7:
-            return f"₹{num/1e7:.2f} L Cr."
+            return f"₹{num/1e7:.2f} Cr."
         if num >= 1e5:
             return f"₹{num/1e5:.2f} L"
         return f"₹{num:,.2f}"
@@ -86,23 +96,29 @@ def run_prediction(symbol: str):
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
 
-    info = ticker.info or {}
+    df = df[["Open", "High", "Low", "Close", "Volume"]].replace(
+        [np.inf, -np.inf], np.nan).dropna().sort_index()
+    if len(df) < 120 or (df['Close'] <= 0).any():
+        raise ValueError(f"Not enough valid price data for {symbol}.")
+    try:
+        info = ticker.info or {}
+    except Exception:
+        info = {}  # Optional fundamentals must not block the forecast.
 
     # ── Feature matrix ──────────────────────────────────────────────────────
     stock_data = df[["Open", "High", "Low", "Close", "Volume"]].values
 
+    train_end = int(0.7 * len(stock_data))
     split = int(0.8 * len(stock_data))
     scaler = MinMaxScaler()
-    train_scaled = scaler.fit_transform(stock_data[:split])
-    test_scaled  = scaler.transform(stock_data[split:])
+    train_scaled = scaler.fit_transform(stock_data[:train_end])
+    test_scaled  = scaler.transform(stock_data[train_end:])
     scaled_data  = np.vstack((train_scaled, test_scaled))
 
     X, y = prepare_sequences(scaled_data)
-    n_train = split - 60
-    X_train, X_test = X[:n_train], X[n_train:]
-    y_train, y_test = y[:n_train], y[n_train:]
-
-    es = EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True)
+    n_train, n_val_end = train_end - 60, split - 60
+    X_train, X_val, X_test = X[:n_train], X[n_train:n_val_end], X[n_val_end:]
+    y_train, y_val, y_test = y[:n_train], y[n_train:n_val_end], y[n_val_end:]
 
     # ── LSTM ─────────────────────────────────────────────────────────────────
     lstm_model = Sequential([
@@ -114,8 +130,9 @@ def run_prediction(symbol: str):
     ])
     lstm_model.compile(optimizer='adam', loss='mse')
     lstm_model.fit(X_train, y_train, epochs=50, batch_size=32,
-                   validation_data=(X_test, y_test),
-                   callbacks=[es], verbose=0)
+                   validation_data=(X_val, y_val), shuffle=False,
+                   callbacks=[EarlyStopping(monitor='val_loss', patience=5,
+                                            restore_best_weights=True)], verbose=0)
 
     # ── GRU ──────────────────────────────────────────────────────────────────
     gru_model = Sequential([
@@ -127,8 +144,9 @@ def run_prediction(symbol: str):
     ])
     gru_model.compile(optimizer='adam', loss='mse')
     gru_model.fit(X_train, y_train, epochs=50, batch_size=32,
-                  validation_data=(X_test, y_test),
-                  callbacks=[es], verbose=0)
+                  validation_data=(X_val, y_val), shuffle=False,
+                  callbacks=[EarlyStopping(monitor='val_loss', patience=5,
+                                           restore_best_weights=True)], verbose=0)
 
     # ── Evaluate ─────────────────────────────────────────────────────────────
     lstm_pred_s = lstm_model.predict(X_test, verbose=0)
@@ -137,7 +155,9 @@ def run_prediction(symbol: str):
     lstm_rmse = float(np.sqrt(mean_squared_error(y_test, lstm_pred_s)))
     gru_rmse  = float(np.sqrt(mean_squared_error(y_test, gru_pred_s)))
 
-    best_name  = 'LSTM' if lstm_rmse <= gru_rmse else 'GRU'
+    lstm_val = mean_squared_error(y_val, lstm_model.predict(X_val, verbose=0))
+    gru_val = mean_squared_error(y_val, gru_model.predict(X_val, verbose=0))
+    best_name = 'LSTM' if lstm_val <= gru_val else 'GRU'
     best_model = lstm_model if best_name == 'LSTM' else gru_model
     best_pred_s = lstm_pred_s if best_name == 'LSTM' else gru_pred_s
 
@@ -171,17 +191,19 @@ def run_prediction(symbol: str):
     # ── Fundamentals ─────────────────────────────────────────────────────────
     def fmt_pct(v):
         if v == "N/A": return "N/A"
-        return f"{float(v)*100:.2f}%" if abs(float(v)) < 10 else f"{float(v):.2f}%"
+        return f"{float(v)*100:.2f}%"
 
     pe    = safe_get(info, 'trailingPE', 'forwardPE')
     pb    = safe_get(info, 'priceToBook')
     mkcap = safe_get(info, 'marketCap')
     eps   = safe_get(info, 'trailingEps')
-    div   = safe_get(info, 'dividendYield')
+    # Derive the ratio explicitly instead of guessing provider percentage units.
+    div_rate = safe_get(info, 'dividendRate', 'trailingAnnualDividendRate')
+    div = float(div_rate) / current_close if div_rate != "N/A" else "N/A"
     bv    = safe_get(info, 'bookValue')
     promo = safe_get(info, 'heldPercentInsiders')
     roe   = safe_get(info, 'returnOnEquity')
-    roce  = safe_get(info, 'returnOnAssets')
+    roa   = safe_get(info, 'returnOnAssets')
     sector = safe_get(info, 'sector', 'industry', default='—')
     name   = safe_get(info, 'longName', 'shortName', default=symbol)
 
@@ -194,7 +216,7 @@ def run_prediction(symbol: str):
 
     day_change    = "N/A"
     day_change_pct = "N/A"
-    if prev_close != "N/A":
+    if prev_close != "N/A" and float(prev_close) != 0:
         dc = current_close - float(prev_close)
         day_change     = f"{'+' if dc >= 0 else ''}{dc:.2f}"
         day_change_pct = f"{'+' if dc >= 0 else ''}{dc/float(prev_close)*100:.2f}%"
@@ -229,7 +251,7 @@ def run_prediction(symbol: str):
         "book_value": round(float(bv), 2) if bv != "N/A" else "N/A",
         "promo_hold": fmt_pct(promo) if promo != "N/A" else "N/A",
         "roe":  fmt_pct(roe)  if roe  != "N/A" else "N/A",
-        "roce": fmt_pct(roce) if roce != "N/A" else "N/A",
+        "roa": fmt_pct(roa) if roa != "N/A" else "N/A",
         # Chart
         "hist_dates":    hist_dates,
         "hist_close":    hist_close,
@@ -246,20 +268,89 @@ def index():
     return render_template('index.html')
 
 
+@app.route('/options')
+def options():
+    directory = Path(app.config['OPTION_RESULTS_DIR'])
+    metrics_path = directory / 'overall_metrics.csv'
+    metrics = pd.read_csv(metrics_path).to_dict('records') if metrics_path.exists() else []
+    charts = [{'filename': filename, 'title': title, 'description': description}
+              for filename, (title, description) in OPTION_CHARTS.items()
+              if (directory / filename).is_file()]
+    return render_template('options.html', metrics=metrics, charts=charts)
+
+
+@app.route('/options/charts/<filename>')
+def option_chart(filename):
+    if filename not in OPTION_CHARTS:
+        abort(404)
+    return send_from_directory(app.config['OPTION_RESULTS_DIR'], filename, max_age=0)
+
+
 @app.route('/predict', methods=['POST'])
 def predict():
-    body   = request.get_json(silent=True) or {}
-    raw    = body.get('symbol', '').strip()
+    body = request.get_json(silent=True)
+    if not isinstance(body, dict) or not isinstance(body.get('symbol'), str):
+        return jsonify({'error': 'Please enter a stock symbol.'}), 400
+    raw = body['symbol'].strip()
     if not raw:
         return jsonify({'error': 'Please enter a stock symbol.'}), 400
 
-    symbol = clean_symbol(raw)
     try:
+        symbol = clean_symbol(raw)
         result = run_prediction(symbol)
         return jsonify(result)
+    except ValueError as e:
+        return jsonify({'error': str(e)}), 400
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
 
+@app.route('/api/stock-options', methods=['POST'])
+def stock_options():
+    from src.stock_options import read_contracts, compare_stock_options
+    if request.content_length and request.content_length > app.config['MAX_CONTENT_LENGTH']:
+        abort(413)
+    body = request.form if request.mimetype == 'multipart/form-data' else request.get_json(silent=True)
+    if not isinstance(body, dict) or not isinstance(body.get('symbol'), str):
+        return jsonify(error='Please enter an NSE stock symbol.'), 400
+    try:
+        symbol = clean_symbol(body['symbol'])
+        mode = body.get('mode', 'simulation')
+        if mode not in ('simulation', 'observed'):
+            raise ValueError('Choose simulation or observed-premium comparison.')
+        try:
+            rate, dividend = float(body.get('rate', .05)), float(body.get('dividend', 0))
+        except (ValueError, TypeError):
+            raise ValueError('Rate and dividend yield must be numbers.')
+        if not np.isfinite([rate, dividend]).all() or not 0 <= rate <= .3 or not 0 <= dividend <= .3:
+            raise ValueError('Rate and dividend yield must be between 0 and 0.30 (0%–30%).')
+        contracts = None
+        if mode == 'observed':
+            uploaded = request.files.get('contracts')
+            if uploaded is None or not uploaded.filename:
+                raise ValueError('Upload historical call premiums for observed-data comparison.')
+            contracts = read_contracts(uploaded.stream, symbol)
+            start = (contracts.date.min() - pd.Timedelta(days=400)).strftime('%Y-%m-%d')
+            end = (contracts.date.max() + pd.Timedelta(days=1)).strftime('%Y-%m-%d')
+        else:
+            start = (pd.Timestamp.today() - pd.Timedelta(days=3 * 365)).strftime('%Y-%m-%d')
+            end = pd.Timestamp.today().strftime('%Y-%m-%d')
+        history = yf.download(symbol, start=start, end=end, auto_adjust=True,
+                              progress=False, threads=False)
+        result = compare_stock_options(symbol, history, rate, dividend, contracts,
+                                       epochs=app.config['STOCK_OPTION_EPOCHS'])
+        return jsonify(result)
+    except ValueError as exc:
+        return jsonify(error=str(exc)), 400
+    except Exception:
+        app.logger.exception('Stock option comparison failed')
+        return jsonify(error='Could not complete the option comparison. Check the data connection and try again.'), 500
+
+
+@app.errorhandler(413)
+def upload_too_large(error):
+    return jsonify(error='The option CSV must be smaller than 2 MB.'), 413
+
+
 if __name__ == '__main__':
-    app.run(debug=True, use_reloader=False)
+    app.run(debug=False, use_reloader=False)

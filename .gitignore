@@ -1,5 +1,8 @@
 # Python bytecode & cache
 __pycache__/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 *.py[cod]
 *$py.class
 
@@ -10,12 +13,18 @@ __pycache__/
 *.h5
 *.keras
 
-# Generated plots & images
-*.png
-*.jpg
-*.jpeg
-*.svg
-outputs/*.png
+# Generated training results and runtime logs
+/outputs/
+
+# Local screenshots and reference material
+/image.png
+/interface.png
+/s13042-026-03196-0.pdf
+
+# Local credentials and environment settings
+.env
+.env.*
+!.env.example
 
 # Jupyter Notebook checkpoints
 .ipynb_checkpoints/
@@ -24,6 +33,7 @@ outputs/*.png
 env/
 venv/
 .venv/
+.uv-cache/
 
 # IDE / Editor artifacts
 .vscode/

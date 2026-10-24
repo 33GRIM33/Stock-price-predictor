@@ -1,0 +1,116 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>StockSight</title>
+  <style>
+    body { margin:0; background:#f3f6fa; color:#18263b; font:16px system-ui,sans-serif; }
+    main { max-width:1000px; margin:48px auto; padding:0 24px; }
+    h1 { margin-bottom:8px; } p { line-height:1.6; }
+    form,.panel { background:white; border:1px solid #dce3ec; border-radius:12px; padding:24px; margin:20px 0; }
+    input,button { font:inherit; padding:12px; border-radius:6px; border:1px solid #aebacd; }
+    input { max-width:100%; box-sizing:border-box; } button { background:#2456c4; color:white; cursor:pointer; }
+    button:disabled { opacity:.6; cursor:wait; } label { display:block; margin-bottom:10px; }
+    dl { display:grid; grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); gap:20px; }
+    dt { color:#58697e; font-size:14px; } dd { margin:6px 0; font-weight:600; }
+    svg { display:block; width:100%; height:auto; } .error { color:#a52222; }
+    .actions { display:flex; flex-wrap:wrap; gap:10px; margin-top:18px; }
+    .winner { border-left:5px solid #16803c; }
+    .winner h3 { margin:10px 0; font-size:26px; }
+    .best-row { background:#eef9f1; font-weight:600; }
+    summary { cursor:pointer; font-weight:600; }
+    .table-wrap { overflow-x:auto; } table { border-collapse:collapse; width:100%; }
+    th,td { padding:10px; border-bottom:1px solid #dce3ec; text-align:right; white-space:nowrap; }
+    th:first-child,td:first-child { text-align:left; }
+    .badge { background:#e8efff; padding:8px 12px; display:inline-block; border-radius:8px; }
+    .legend { display:flex; gap:16px; flex-wrap:wrap; font-size:14px; }
+  </style>
+</head>
+<body><main>
+  <h1>StockSight</h1>
+  <p>Search an Indian stock to compare Black-Scholes, Direct ANN, Residual ANN and Option LSTM call prices, alongside LSTM and GRU stock forecasts.</p>
+  <p><a href="/options">View the separate saved synthetic benchmark</a></p>
+  <form id="search">
+    <label for="symbol">NSE stock symbol</label>
+    <input id="symbol" name="symbol" placeholder="RELIANCE" required maxlength="40">
+    <div class="actions">
+    <button id="submit" type="submit">Generate forecast + option comparison</button>
+    <button id="options-only" type="submit">Compare options only</button>
+    </div>
+    <p>Enter a symbol and run the comparison. Training can take a few minutes.</p>
+  </form>
+  <p id="option-status" role="status" aria-live="polite"></p>
+  <section id="option-result" hidden>
+    <div class="panel winner"><h2 id="option-title"></h2><span class="badge" id="option-source"></span><p id="option-context"></p><h3 id="option-winner"></h3><p id="option-verdict"></p></div>
+    <div class="panel"><h2>Which model performed best?</h2><p>Ranked by test error (RMSE): lower is better. Average error (MAE) shows the typical price difference in rupees per share. R² closer to 1 means a better fit.</p><div class="table-wrap" id="option-metrics"></div><div id="option-error-chart"></div></div>
+    <div class="panel"><h2>How closely do the predictions match?</h2><p id="option-target-label"></p><div class="legend" id="option-legend"></div><div id="option-price-chart"></div></div>
+    <details class="panel"><summary>View individual contracts and download results</summary><p>Latest 50 test observations. Download includes all test contracts; prices are rupees per share.</p><button id="download-options" type="button">Download results (CSV)</button><div class="table-wrap" id="option-contracts"></div></details>
+  </section>
+  <p id="status" role="status" aria-live="polite"></p>
+  <section id="result" hidden>
+    <div class="panel"><h2 id="company"></h2><p id="sector"></p><dl id="metrics"></dl></div>
+    <div class="panel"><h2>Historical close</h2><div id="history"></div></div>
+    <div class="panel"><h2>Held-out close predictions</h2><p>Blue: actual · Orange: predicted</p><div id="comparison"></div></div>
+    <div class="panel"><h2>Fundamentals</h2><dl id="fundamentals"></dl></div>
+  </section>
+  <p>Experimental forecasts based on historical prices. Results are not guaranteed. RMSE is measured on scaled open/close prices; lower is better.</p>
+</main>
+<script src="{{ url_for('static', filename='stock_options.js') }}"></script>
+<script>
+const byId = id => document.getElementById(id);
+function fields(id, entries) {
+  const target = byId(id); target.replaceChildren();
+  for (const [label, value] of entries) {
+    const group = document.createElement('div');
+    const dt = document.createElement('dt'); dt.textContent = label;
+    const dd = document.createElement('dd'); dd.textContent = value;
+    group.append(dt, dd); target.append(group);
+  }
+}
+function chart(id, dates, series) {
+  const target = byId(id); target.replaceChildren();
+  const values = series.flatMap(s => s.values).filter(Number.isFinite);
+  if (!values.length) { target.textContent = 'No chart data available.'; return; }
+  const ns = 'http://www.w3.org/2000/svg', svg = document.createElementNS(ns, 'svg');
+  svg.setAttribute('viewBox', '0 0 900 300'); svg.setAttribute('role', 'img');
+  svg.setAttribute('aria-label', `Close prices from ${dates[0]} to ${dates.at(-1)}`);
+  const low = Math.min(...values), high = Math.max(...values), span = high-low || 1;
+  for (const s of series) {
+    const line = document.createElementNS(ns, 'polyline');
+    line.setAttribute('points', s.values.map((v,i) => `${80+i*800/Math.max(1,s.values.length-1)},${260-(v-low)*230/span}`).join(' '));
+    line.setAttribute('fill','none'); line.setAttribute('stroke',s.color); line.setAttribute('stroke-width','2'); svg.append(line);
+  }
+  for (const [x,y,value] of [[0,30,`₹${high.toFixed(2)}`],[0,260,`₹${low.toFixed(2)}`],[80,290,dates[0]],[780,290,dates.at(-1)]]) {
+    const label = document.createElementNS(ns,'text'); label.setAttribute('x',x); label.setAttribute('y',y); label.setAttribute('font-size','13'); label.textContent=value; svg.append(label);
+  }
+  target.append(svg);
+}
+async function generateForecast(symbol) {
+  byId('result').hidden=true;
+  byId('status').className=''; byId('status').textContent='Fetching prices and training models…';
+  try {
+    const response=await fetch('/predict',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({symbol})});
+    const d=await response.json(); if (!response.ok) throw new Error(d.error || 'Prediction failed.');
+    byId('company').textContent=`${d.name} (${d.symbol})`; byId('sector').textContent=d.sector;
+    fields('metrics', [['Latest close',`₹${d.current_close}`],['Next session open',`₹${d.next_open}`],['Next session close',`₹${d.next_close}`],['Forecast change',`${d.direction} · ${d.change_pct}%`],['Selected model',d.best_model],['LSTM test RMSE',d.lstm_rmse],['GRU test RMSE',d.gru_rmse]]);
+    fields('fundamentals', [['P/E',d.pe],['P/B',d.pb],['Market cap',d.mkcap],['EPS',d.eps],['Dividend yield',d.div_yield],['Book value',d.book_value],['Insider holdings',d.promo_hold],['Return on equity',d.roe],['Return on assets',d.roa]]);
+    chart('history',d.hist_dates,[{values:d.hist_close,color:'#2456c4'}]);
+    chart('comparison',d.test_dates,[{values:d.actual_close,color:'#2456c4'},{values:d.pred_close,color:'#c76713'}]);
+    byId('result').hidden=false; byId('status').textContent='Forecast ready.';
+  } catch (error) { byId('status').className='error'; byId('status').textContent=error.message; }
+}
+byId('search').addEventListener('submit', async event => {
+  event.preventDefault();
+  const optionsOnly = event.submitter?.id === 'options-only';
+  const symbol = byId('symbol').value;
+  const data = new FormData(byId('search'));
+  byId('submit').disabled=true; byId('options-only').disabled=true;
+  byId('result').hidden=true; byId('status').textContent='';
+  try {
+    const tasks = [window.runOptionComparison(data)];
+    if (!optionsOnly) tasks.push(generateForecast(symbol));
+    await Promise.allSettled(tasks);
+  } finally { byId('submit').disabled=false; byId('options-only').disabled=false; }
+});
+</script></body></html>

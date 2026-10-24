@@ -3,12 +3,10 @@ Option Data Generation and Loading Module.
 Supports:
 1. Synthetic market options data with realistic volatility smile/skew and market noise.
 2. Sequence feature generation for LSTM temporal modeling.
-3. Live option chain downloading via yfinance.
 """
 
 import numpy as np
 import pandas as pd
-import yfinance as yf
 from src.pricing import black_scholes_call, black_scholes_put
 
 

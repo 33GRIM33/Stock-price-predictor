@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Option Model Comparison · StockSight</title>
+  <style>
+    body { margin:0; background:#f3f6fa; color:#18263b; font:16px system-ui,sans-serif; }
+    main { max-width:1100px; margin:40px auto; padding:0 20px; }
+    a { color:#2456c4; } h1 { font-size:clamp(28px,5vw,42px); margin-bottom:12px; }
+    p { line-height:1.65; color:#53647a; }
+    .panel { background:white; border:1px solid #dce3ec; border-radius:14px; padding:24px; margin:24px 0; }
+    .badge { display:inline-block; background:#e8efff; color:#2456c4; padding:6px 12px; border-radius:20px; font-size:13px; }
+    .models { display:grid; grid-template-columns:repeat(auto-fit,minmax(210px,1fr)); gap:16px; }
+    .models article { padding:16px; border-left:4px solid var(--color); background:white; border-radius:6px; }
+    .models p { margin-bottom:0; font-size:14px; }
+    .table-wrap { overflow-x:auto; } table { border-collapse:collapse; width:100%; text-align:left; }
+    th,td { padding:14px; border-bottom:1px solid #e3e9f0; white-space:nowrap; }
+    th { background:#f3f6fa; } td:not(:first-child) { font-variant-numeric:tabular-nums; }
+    img { width:100%; height:auto; display:block; } .chart-links { display:flex; flex-wrap:wrap; gap:12px; }
+    .chart-links a { padding:8px 12px; border:1px solid #cbd6e5; border-radius:6px; text-decoration:none; }
+    section { scroll-margin-top:20px; } code { overflow-wrap:anywhere; }
+  </style>
+</head>
+<body><main>
+  <nav><a href="/">← Stock forecasting</a></nav>
+  <h1>Saved synthetic benchmark</h1>
+  <span class="badge">Synthetic European call options · Held-out test results</span>
+  <p>This is the original independent synthetic benchmark. For Black-Scholes, ANN, Residual ANN and Option LSTM results calibrated to a searched stock, <a href="/">use the stock search and comparison form</a>.</p>
+  <div class="models">
+    <article style="--color:gray"><strong>Black-Scholes</strong><p>Analytical baseline using historical volatility. No neural-network training.</p></article>
+    <article style="--color:blue"><strong>Direct ANN</strong><p>Learns option prices directly from contract features.</p></article>
+    <article style="--color:green"><strong>Residual ANN</strong><p>Learns a correction and adds it to the Black-Scholes price.</p></article>
+    <article style="--color:purple"><strong>Option LSTM</strong><p>Combines simulated price sequences with contract features.</p></article>
+  </div>
+  {% if metrics %}
+  <section class="panel">
+    <h2>Test accuracy</h2>
+    <p>RMSE penalizes larger mistakes; MAE is the average absolute error. Lower is better for both. R² closer to 1 indicates a better fit. Price errors use the synthetic dataset's price units.</p>
+    <div class="table-wrap"><table>
+      <thead><tr><th scope="col">Model</th><th scope="col">RMSE ↓</th><th scope="col">MAE ↓</th><th scope="col">R² ↑</th></tr></thead>
+      <tbody>{% for row in metrics %}<tr><th scope="row">{{ row.Model }}</th><td>{{ '%.4f'|format(row.RMSE) }}</td><td>{{ '%.4f'|format(row.MAE) }}</td><td>{{ '%.4f'|format(row.R2) }}</td></tr>{% endfor %}</tbody>
+    </table></div>
+  </section>
+  <nav class="chart-links" aria-label="Comparison graphs">{% for chart in charts %}<a href="#graph-{{ loop.index }}">{{ chart.title }}</a>{% endfor %}</nav>
+  {% for chart in charts %}
+  <section class="panel" id="graph-{{ loop.index }}">
+    <h2>{{ chart.title }}</h2><p>{{ chart.description }}</p>
+    <a href="{{ url_for('option_chart', filename=chart.filename) }}" target="_blank" rel="noopener" aria-label="Open {{ chart.title }} at full size">
+      <img src="{{ url_for('option_chart', filename=chart.filename) }}" alt="{{ chart.title }}" {% if not loop.first %}loading="lazy"{% endif %}>
+    </a>
+    <p><a href="{{ url_for('option_chart', filename=chart.filename) }}" download>Download graph</a></p>
+  </section>
+  {% endfor %}
+  {% else %}
+  <section class="panel"><h2>No comparison run available yet</h2><p>Generate results with <code>python train.py --samples 3000 --epochs 30 --output-dir outputs/comparison</code>, then refresh this page.</p></section>
+  {% endif %}
+  <p>These experiments use simulated prices and histories. Their accuracy does not establish performance on real market contracts.</p>
+</main></body></html>

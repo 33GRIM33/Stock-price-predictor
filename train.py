@@ -9,6 +9,7 @@ Compares:
 
 import os
 import argparse
+import joblib
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -264,6 +265,7 @@ def plot_results(df_test, train_losses_dict, output_dir="outputs"):
     plt.scatter(sort_idx['moneyness'], np.abs(sort_idx['C_market'] - sort_idx['pred_bs']), color='red', alpha=0.3, label='Black-Scholes Error |C_market - C_bs|')
     plt.scatter(sort_idx['moneyness'], np.abs(sort_idx['C_market'] - sort_idx['pred_ann_direct']), color='blue', alpha=0.3, label='ANN Direct Absolute Error')
     plt.scatter(sort_idx['moneyness'], np.abs(sort_idx['C_market'] - sort_idx['pred_ann_resid']), color='green', alpha=0.3, label='ANN Residual Absolute Error')
+    plt.scatter(sort_idx['moneyness'], np.abs(sort_idx['C_market'] - sort_idx['pred_lstm']), color='purple', alpha=0.3, label='Option LSTM Absolute Error')
     plt.axvline(0.97, color='black', linestyle=':', label='OTM/ATM Boundary')
     plt.axvline(1.03, color='black', linestyle='--', label='ATM/ITM Boundary')
     plt.xlabel('Moneyness (S / K)')
@@ -275,10 +277,46 @@ def plot_results(df_test, train_losses_dict, output_dir="outputs"):
     plt.savefig(os.path.join(output_dir, 'error_across_moneyness.png'), dpi=300)
     plt.close()
 
+    # Comparable held-out metrics for every method, including the baseline.
+    columns = ['pred_bs', 'pred_ann_direct', 'pred_ann_resid', 'pred_lstm']
+    names = ['Black-Scholes', 'Direct ANN', 'Residual ANN', 'Option LSTM']
+    colors = ['gray', 'blue', 'green', 'purple']
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+    for axis, metric in zip(axes, ['RMSE', 'MAE']):
+        values = [evaluate_predictions(df_test['C_market'], df_test[col])[metric] for col in columns]
+        axis.bar(names, values, color=colors, alpha=.8)
+        axis.set_ylabel(f'{metric} (price units)')
+        axis.tick_params(axis='x', rotation=20)
+        axis.grid(axis='y', alpha=.2)
+    fig.suptitle('Held-out Option Pricing Error — Lower Is Better')
+    fig.tight_layout()
+    fig.savefig(os.path.join(output_dir, 'overall_comparison.png'), dpi=180)
+    plt.close(fig)
+
+    fig, axis = plt.subplots(figsize=(12, 5))
+    categories = ['OTM', 'ATM', 'ITM']
+    x = np.arange(len(categories))
+    for i, (col, name, color) in enumerate(zip(columns, names, colors)):
+        values = []
+        for category in categories:
+            subset = df_test[df_test['moneyness_cat'] == category]
+            values.append(np.sqrt(mean_squared_error(subset['C_market'], subset[col])) if len(subset) else np.nan)
+        axis.bar(x + (i - 1.5) * .2, values, .2, label=name, color=color, alpha=.8)
+    axis.set_xticks(x, categories)
+    axis.set_ylabel('RMSE (price units)')
+    axis.set_title('Held-out Error by Call Moneyness')
+    axis.legend()
+    axis.grid(axis='y', alpha=.2)
+    fig.tight_layout()
+    fig.savefig(os.path.join(output_dir, 'moneyness_comparison.png'), dpi=180)
+    plt.close(fig)
+
     print(f"\n[Artifacts] Visual plots successfully saved to '{output_dir}/'")
 
 
-def run_pipeline(n_samples=10000, epochs=50, batch_size=64, lr=0.001):
+def run_pipeline(n_samples=10000, epochs=50, batch_size=64, lr=0.001, output_dir="outputs"):
+    if n_samples < 20 or epochs < 1 or batch_size < 1 or not np.isfinite(lr) or lr <= 0:
+        raise ValueError("Use at least 20 samples, positive epochs/batch size, and a positive finite learning rate")
     set_seed(42)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using Compute Device: {device}")
@@ -305,13 +343,14 @@ def run_pipeline(n_samples=10000, epochs=50, batch_size=64, lr=0.001):
     X_test_ann = scaler_x.transform(df_test[ann_features].values)
 
     scaler_y_direct = StandardScaler()
-    y_train_direct = scaler_y_direct.fit_transform(df_train[['C_market']].values)
-    y_val_direct = scaler_y_direct.transform(df_val[['C_market']].values)
+    # Inputs are scale-free, so targets must also be normalized by strike.
+    y_train_direct = scaler_y_direct.fit_transform((df_train['C_market'] / df_train['K']).values[:, None])
+    y_val_direct = scaler_y_direct.transform((df_val['C_market'] / df_val['K']).values[:, None])
 
     # Prepare targets for ANN Residual: E = C_market - C_bs
     scaler_y_resid = StandardScaler()
-    y_train_resid = scaler_y_resid.fit_transform(df_train[['C_error']].values)
-    y_val_resid = scaler_y_resid.transform(df_val[['C_error']].values)
+    y_train_resid = scaler_y_resid.fit_transform((df_train['C_error'] / df_train['K']).values[:, None])
+    y_val_resid = scaler_y_resid.transform((df_val['C_error'] / df_val['K']).values[:, None])
 
     # 2. Step 1: Train ANN Direct
     ann_direct, tr_loss_dir, val_loss_dir = train_ann_direct(
@@ -357,14 +396,14 @@ def run_pipeline(n_samples=10000, epochs=50, batch_size=64, lr=0.001):
     with torch.no_grad():
         t_x_test = torch.tensor(X_test_ann, dtype=torch.float32).to(device)
         pred_scaled_dir = ann_direct(t_x_test).cpu().numpy()
-        pred_ann_direct = scaler_y_direct.inverse_transform(pred_scaled_dir).flatten()
+        pred_ann_direct = scaler_y_direct.inverse_transform(pred_scaled_dir).flatten() * df_test['K'].values
         pred_ann_direct = np.maximum(0.0, pred_ann_direct)
 
     # ANN Residual
     ann_resid.eval()
     with torch.no_grad():
         pred_scaled_res = ann_resid(t_x_test).cpu().numpy()
-        pred_error = scaler_y_resid.inverse_transform(pred_scaled_res).flatten()
+        pred_error = scaler_y_resid.inverse_transform(pred_scaled_res).flatten() * df_test['K'].values
         # Final price = C_bs + E_hat
         pred_ann_resid = np.maximum(0.0, df_test['C_bs'].values + pred_error)
 
@@ -374,7 +413,7 @@ def run_pipeline(n_samples=10000, epochs=50, batch_size=64, lr=0.001):
         t_seq = torch.tensor(X_seq_te, dtype=torch.float32).to(device)
         t_st = torch.tensor(X_st_te, dtype=torch.float32).to(device)
         pred_scaled_lstm = lstm_model(t_seq, t_st).cpu().numpy()
-        pred_lstm = scaler_y_direct.inverse_transform(pred_scaled_lstm).flatten()
+        pred_lstm = scaler_y_direct.inverse_transform(pred_scaled_lstm).flatten() * df_test['K'].values
         pred_lstm = np.maximum(0.0, pred_lstm)
 
     df_test['pred_bs'] = pred_bs
@@ -405,14 +444,18 @@ def run_pipeline(n_samples=10000, epochs=50, batch_size=64, lr=0.001):
     print(money_df.to_string(index=False))
 
     # Save metrics
-    os.makedirs("outputs", exist_ok=True)
-    overall_df.to_csv("outputs/overall_metrics.csv", index=False)
-    money_df.to_csv("outputs/moneyness_metrics.csv", index=False)
+    os.makedirs(output_dir, exist_ok=True)
+    overall_df.to_csv(os.path.join(output_dir, "overall_metrics.csv"), index=False)
+    money_df.to_csv(os.path.join(output_dir, "moneyness_metrics.csv"), index=False)
+    joblib.dump({"features": ann_features, "scaler_x": scaler_x,
+                 "scaler_y_direct": scaler_y_direct, "scaler_y_resid": scaler_y_resid,
+                 "target_normalization": "divide_by_strike", "sequence_length": 15},
+                os.path.join(output_dir, "preprocessing.joblib"))
 
     # Save models
-    torch.save(ann_direct.state_dict(), "outputs/ann_direct.pth")
-    torch.save(ann_resid.state_dict(), "outputs/ann_resid.pth")
-    torch.save(lstm_model.state_dict(), "outputs/lstm_model.pth")
+    torch.save(ann_direct.state_dict(), os.path.join(output_dir, "ann_direct.pth"))
+    torch.save(ann_resid.state_dict(), os.path.join(output_dir, "ann_resid.pth"))
+    torch.save(lstm_model.state_dict(), os.path.join(output_dir, "lstm_model.pth"))
 
     # Plot graphs
     loss_dict = {
@@ -420,7 +463,7 @@ def run_pipeline(n_samples=10000, epochs=50, batch_size=64, lr=0.001):
         'ANN Residual': (tr_loss_res, val_loss_res),
         'Option LSTM': (tr_loss_lstm, val_loss_lstm)
     }
-    plot_results(df_test, loss_dict, output_dir="outputs")
+    plot_results(df_test, loss_dict, output_dir=output_dir)
 
     return overall_df, money_df
 
@@ -431,6 +474,7 @@ if __name__ == '__main__':
     parser.add_argument('--epochs', type=int, default=50, help="Training epochs")
     parser.add_argument('--batch_size', type=int, default=64, help="Batch size")
     parser.add_argument('--lr', type=float, default=0.001, help="Learning rate")
+    parser.add_argument('--output-dir', default='outputs', help='Directory for model and evaluation artifacts')
     args = parser.parse_args()
 
-    run_pipeline(n_samples=args.samples, epochs=args.epochs, batch_size=args.batch_size, lr=args.lr)
+    run_pipeline(n_samples=args.samples, epochs=args.epochs, batch_size=args.batch_size, lr=args.lr, output_dir=args.output_dir)
